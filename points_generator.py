@@ -1,8 +1,6 @@
 """
-hierarchical_globe_map.py
-
-Generates three layers of tiles from a simple 3-color equirectangular map.
-Saves metadata including point count for each layer.
+Generates a single unified tile set from a 3-color equirectangular map.
+Builds neighbor graph on full point set first, then samples, then fixes low-degree nodes.
 """
 
 import math
@@ -11,8 +9,7 @@ import struct
 import base64
 import time
 from dataclasses import dataclass, field
-from typing import List, Tuple, Dict, Optional
-from enum import Enum
+from typing import List, Tuple, Dict, Optional, Set
 
 from PIL import Image
 from scipy.spatial import cKDTree
@@ -64,52 +61,41 @@ class ProgressBar:
 # CONFIGURATION
 # ============================================================
 
-LAND_POINTS = 2048 * 1024
+# Base resolution - determines detail level for ALL types
+BASE_POINTS = 2048 * 2048
 
-# Layer configurations
-# count = number of Fibonacci sphere points to generate for this layer
-# The actual number of tiles saved will be less (only those matching the type)
-LAYER_CONFIGS = {
-    "land": {
-        "count": int(LAND_POINTS),
-        "static_file": "land_static.json",
-        "dynamic_file": "land_dynamic.json",
-        "metadata_file": "land_metadata.json",
-        "color": (239, 239, 239)
-    },
-    "coastal": {
-        "count": int(LAND_POINTS/4),
-        "static_file": "coastal_static.json",
-        "dynamic_file": "coastal_dynamic.json",
-        "metadata_file": "coastal_metadata.json",
-        "color": (172, 202, 202)
-    },
-    "deep_sea": {
-        "count": int(LAND_POINTS/16),
-        "static_file": "deep_sea_static.json",
-        "dynamic_file": "deep_sea_dynamic.json",
-        "metadata_file": "deep_sea_metadata.json",
-        "color": (105, 165, 165)
-    }
+# Sampling rates (keep every Nth point of each type)
+SAMPLING_RATES = {
+    "land": 1,
+    "coastal": 5,
+    "deep_sea": 20
+}
+
+# Map colors (RGB)
+COLOR_MAP = {
+    "land": (239, 239, 239),
+    "coastal": (172, 202, 202),
+    "deep_sea": (105, 165, 165)
 }
 
 WORLD_MAP_IMAGE = "terrain_map.png"
 NEIGHBOR_COUNT = 6
+MIN_NEIGHBORS = 3  # Minimum neighbors required after sampling
+
+# Output files
+STATIC_FILE = "tiles_static.json"
+DYNAMIC_FILE = "tiles_dynamic.json"
+METADATA_FILE = "tiles_metadata.json"
 
 
 # ============================================================
 # TILE DATA STRUCTURES
 # ============================================================
 
-class TileType(Enum):
-    LAND = "land"
-    COASTAL = "coastal"
-    DEEP_SEA = "deep_sea"
-
 @dataclass
 class Tile:
     id: int
-    layer: TileType
+    type: str  # "land", "coastal", or "deep_sea"
     x: float = 0.0
     y: float = 0.0
     z: float = 0.0
@@ -181,41 +167,36 @@ def latlon_to_xy(lat: float, lon: float, img_width: int, img_height: int) -> Tup
 
 
 # ============================================================
-# FAST 3-COLOR CLASSIFICATION
+# MAP CLASSIFIER
 # ============================================================
 
-class ThreeColorClassifier:
-    def __init__(self, image_path: str, color_map: Dict[TileType, Tuple[int, int, int]]):
+class MapClassifier:
+    def __init__(self, image_path: str):
         print(f"Loading world map: {image_path}")
         self.img = Image.open(image_path).convert("RGB")
         print(f"  Size: {self.img.width}x{self.img.height}")
         
-        self.color_map = color_map
-        self.rgb_to_type = {rgb: tile_type for tile_type, rgb in color_map.items()}
-        
-        print(f"  Color mapping:")
-        for tile_type, rgb in color_map.items():
-            print(f"    {tile_type.value}: RGB{rgb}")
+        # Convert RGB colors to type mapping
+        self.rgb_to_type = {}
+        for tile_type, rgb in COLOR_MAP.items():
+            self.rgb_to_type[rgb] = tile_type
+            print(f"    {tile_type}: RGB{rgb}")
     
-    def classify_point(self, x: float, y: float, z: float) -> Optional[TileType]:
+    def classify_point(self, x: float, y: float, z: float) -> str:
         lat, lon = xyz_to_latlon(x, y, z)
         px, py = latlon_to_xy(lat, lon, self.img.width, self.img.height)
         rgb = self.img.getpixel((px, py))
         
-        for target_rgb, tile_type in self.rgb_to_type.items():
-            if self._colors_match(rgb, target_rgb):
-                return tile_type
-        
-        return self._find_closest_type(rgb)
-    
-    def _colors_match(self, rgb1: Tuple[int, int, int], rgb2: Tuple[int, int, int], tolerance: int = 10) -> bool:
-        return all(abs(rgb1[i] - rgb2[i]) <= tolerance for i in range(3))
-    
-    def _find_closest_type(self, rgb: Tuple[int, int, int]) -> TileType:
+        # Find closest matching color
+        closest_type = "deep_sea"
         min_dist = float('inf')
-        closest_type = TileType.DEEP_SEA
         
-        for tile_type, target_rgb in self.color_map.items():
+        for target_rgb, tile_type in self.rgb_to_type.items():
+            # Check exact or near match
+            if all(abs(rgb[i] - target_rgb[i]) <= 10 for i in range(3)):
+                return tile_type
+            
+            # Track closest for fallback
             dist = sum((rgb[i] - target_rgb[i]) ** 2 for i in range(3))
             if dist < min_dist:
                 min_dist = dist
@@ -225,240 +206,333 @@ class ThreeColorClassifier:
 
 
 # ============================================================
-# HIERARCHICAL TILE GENERATOR
+# MAIN GENERATOR
 # ============================================================
 
-class HierarchicalTileGenerator:
-    def __init__(self, classifier: ThreeColorClassifier):
+class TileGenerator:
+    def __init__(self, classifier: MapClassifier):
         self.classifier = classifier
-        self.tiles_by_layer: Dict[TileType, List[Tile]] = {
-            TileType.LAND: [],
-            TileType.COASTAL: [],
-            TileType.DEEP_SEA: []
-        }
-        self.total_points_processed = 0
-        self.type_counts = {TileType.LAND: 0, TileType.COASTAL: 0, TileType.DEEP_SEA: 0}
+        self.all_points: List[Tuple[int, str, float, float, float]] = []  # (id, type, x, y, z)
+        self.tiles: List[Tile] = []
+        self.type_counts = {"land": 0, "coastal": 0, "deep_sea": 0}
     
-    def generate_layer(self, target_type: TileType, num_points: int) -> List[Tile]:
-        print(f"\n{'='*60}")
-        print(f"GENERATING {target_type.value.upper()} LAYER")
-        print(f"Points to generate: {num_points:,}")
-        print(f"ID space: 0 to {num_points - 1:,} (with gaps)")
-        print(f"{'='*60}")
+    def generate(self):
+        print("\n" + "="*60)
+        print("TILE GENERATION (PRE-SAMPLING NEIGHBORS)")
+        print("="*60)
+        print(f"\nBase resolution: {BASE_POINTS:,} points")
+        print(f"Minimum neighbors per tile: {MIN_NEIGHBORS}")
+        print("\nSampling rates:")
+        for type_name, rate in SAMPLING_RATES.items():
+            print(f"  {type_name:10}: 1/{rate}")
         
-        # Generate Fibonacci points with progress bar
-        all_points = fibonacci_sphere(num_points, f"  Generating points")
+        # Step 1: Generate all points
+        print("\n" + "="*60)
+        print("STEP 1: GENERATING SPHERE")
+        print("="*60)
+        all_points = fibonacci_sphere(BASE_POINTS, "  Generating points")
         
-        # Filter points
-        print(f"  Filtering points for {target_type.value}...")
-        filtered_tiles = []
-        bar = ProgressBar(num_points, "  Filtering")
+        # Step 2: Classify all points
+        print("\n" + "="*60)
+        print("STEP 2: CLASSIFYING ALL POINTS")
+        print("="*60)
         
-        for original_index, (x, y, z) in enumerate(all_points):
+        bar = ProgressBar(BASE_POINTS, "  Classifying")
+        for idx, (x, y, z) in enumerate(all_points):
             tile_type = self.classifier.classify_point(x, y, z)
             self.type_counts[tile_type] += 1
-            self.total_points_processed += 1
-            
-            if tile_type == target_type:
-                tile = Tile(
-                    id=original_index,
-                    layer=tile_type,
-                    x=x, y=y, z=z
-                )
-                filtered_tiles.append(tile)
-            
+            self.all_points.append((idx, tile_type, x, y, z))
             bar.update(1)
-        
         bar.close()
         
-        print(f"\nGeneration complete for {target_type.value}:")
-        print(f"  Points generated: {num_points:,}")
-        print(f"  Tiles saved: {len(filtered_tiles):,}")
-        print(f"  Retention rate: {len(filtered_tiles)/num_points*100:.1f}%")
+        # Print classification distribution
+        print("\n  Classification distribution:")
+        for tile_type in ["land", "coastal", "deep_sea"]:
+            count = self.type_counts[tile_type]
+            pct = (count / BASE_POINTS) * 100
+            print(f"    {tile_type:10}: {count:>8,} ({pct:5.1f}%)")
         
-        if len(filtered_tiles) > 0:
-            ids = [t.id for t in filtered_tiles]
-            print(f"  ID range: {min(ids)} to {max(ids)}")
-            sample_ids = ids[:10] if len(ids) > 10 else ids
-            print(f"  Sample IDs: {sample_ids}")
+        # Step 3: Build neighbor graph on ALL points (PRE-SAMPLING)
+        print("\n" + "="*60)
+        print("STEP 3: BUILDING NEIGHBOR GRAPH (ALL POINTS)")
+        print("="*60)
+        all_neighbors = self.build_all_neighbors()
         
-        self.tiles_by_layer[target_type] = filtered_tiles
-        return filtered_tiles
+        # Step 4: Sample points for final tiles
+        print("\n" + "="*60)
+        print("STEP 4: SAMPLING POINTS")
+        print("="*60)
+        self.sample_points(all_neighbors)
+        
+        # Step 5: Fix low-degree nodes
+        print("\n" + "="*60)
+        print("STEP 5: FIXING LOW-DEGREE NODES")
+        print("="*60)
+        self.fix_low_degree_nodes()
+        
+        # Step 6: Export
+        print("\n" + "="*60)
+        print("STEP 6: EXPORTING FILES")
+        print("="*60)
+        self.export()
+        
+        # Summary
+        self.print_summary()
     
-    def build_neighbors_for_layer(self, tiles: List[Tile], neighbor_count: int):
-        if len(tiles) < 2:
-            print(f"\nSkipping neighbor graph for {len(tiles)} tiles (too few)")
-            return
+    def build_all_neighbors(self) -> Dict[int, Set[int]]:
+        """Build neighbor graph for ALL points before sampling."""
+        print(f"  Building graph for {len(self.all_points):,} points...")
         
-        print(f"\nBuilding neighbor graph for {len(tiles):,} tiles...")
-        
-        # Build KD-tree
-        print("  Building KD-tree...")
-        positions = [(t.x, t.y, t.z) for t in tiles]
+        # Build KD-tree with all points
+        positions = [(x, y, z) for _, _, x, y, z in self.all_points]
         tree = cKDTree(positions)
         
-        # Query neighbors
-        print("  Querying nearest neighbors...")
-        adjacency = {t.id: set() for t in tiles}
-        k = min(neighbor_count + 1, len(tiles))
+        # Build adjacency
+        k = NEIGHBOR_COUNT + 1
+        adjacency = {point_id: set() for point_id, _, _, _, _ in self.all_points}
         
-        bar = ProgressBar(len(tiles), "  Processing tiles")
+        bar = ProgressBar(len(self.all_points), "  Processing")
         
-        for i, tile in enumerate(tiles):
-            distances, indices = tree.query((tile.x, tile.y, tile.z), k=k)
-            nearest = indices[1:] if len(indices) > 1 else []
+        for i, (point_id, _, x, y, z) in enumerate(self.all_points):
+            distances, indices = tree.query((x, y, z), k=min(k, len(self.all_points)))
             
-            for neighbor_idx in nearest:
-                neighbor_id = tiles[neighbor_idx].id
-                adjacency[tile.id].add(neighbor_id)
-                adjacency[neighbor_id].add(tile.id)
+            # Skip the first index (itself)
+            for neighbor_idx in indices[1:]:
+                neighbor_id = self.all_points[neighbor_idx][0]
+                adjacency[point_id].add(neighbor_id)
+                # Neighbor will add this point when processed
             
             bar.update(1)
         
         bar.close()
         
-        # Store neighbors
-        print("  Storing neighbor lists...")
-        for tile in tiles:
-            tile.neighbors = sorted(list(adjacency[tile.id]))
-        
         # Statistics
-        degrees = [len(t.neighbors) for t in tiles]
+        degrees = [len(adjacency[pid]) for pid in adjacency]
         avg_degree = sum(degrees) / len(degrees) if degrees else 0
-        print(f"  Neighbor statistics:")
-        print(f"    Average: {avg_degree:.1f}")
-        print(f"    Min: {min(degrees) if degrees else 0}")
-        print(f"    Max: {max(degrees) if degrees else 0}")
-    
-    def export_layer(self, tile_type: TileType, config: dict):
-        """Export a single layer to JSON files including metadata."""
-        tiles = self.tiles_by_layer[tile_type]
+        print(f"  All points graph statistics:")
+        print(f"    Average neighbors: {avg_degree:.2f}")
+        print(f"    Min neighbors: {min(degrees)}")
+        print(f"    Max neighbors: {max(degrees)}")
         
-        if not tiles:
-            print(f"\nNo {tile_type.value} tiles to export")
+        return adjacency
+    
+    def sample_points(self, full_adjacency: Dict[int, Set[int]]):
+        """Sample points based on rates, preserving neighbor relationships."""
+        print("  Sampling points...")
+        
+        # Track counters for sampling
+        counters = {"land": 0, "coastal": 0, "deep_sea": 0}
+        
+        bar = ProgressBar(len(self.all_points), "  Processing")
+        
+        for point_id, tile_type, x, y, z in self.all_points:
+            counters[tile_type] += 1
+            rate = SAMPLING_RATES[tile_type]
+            
+            # Sample this point?
+            if counters[tile_type] % rate == 0:
+                tile = Tile(
+                    id=point_id,
+                    type=tile_type,
+                    x=x, y=y, z=z
+                )
+                # Copy neighbors, filtering to only those that will also be sampled
+                # We'll fix this in the next step
+                self.tiles.append(tile)
+            
+            bar.update(1)
+        
+        bar.close()
+        
+        # Create lookup for sampled points
+        sampled_ids = {t.id for t in self.tiles}
+        
+        # Filter neighbor lists to only include sampled points
+        sampled_adjacency = {}
+        for tile in self.tiles:
+            # Get all neighbors from full graph
+            full_neighbors = full_adjacency.get(tile.id, set())
+            # Keep only those that were also sampled
+            filtered_neighbors = full_neighbors & sampled_ids
+            sampled_adjacency[tile.id] = filtered_neighbors
+        
+        # Apply filtered neighbors to tiles
+        for tile in self.tiles:
+            tile.neighbors = sorted(sampled_adjacency.get(tile.id, set()))
+        
+        # Statistics after sampling
+        degrees = [len(t.neighbors) for t in self.tiles]
+        print(f"\n  After sampling (before fixing):")
+        print(f"    Sampled tiles: {len(self.tiles):,}")
+        print(f"    Average neighbors: {sum(degrees)/len(degrees):.2f}")
+        print(f"    Min neighbors: {min(degrees)}")
+        print(f"    Max neighbors: {max(degrees)}")
+        
+        low_degree = sum(1 for d in degrees if d < MIN_NEIGHBORS)
+        print(f"    Tiles with <{MIN_NEIGHBORS} neighbors: {low_degree:,}")
+    
+    def fix_low_degree_nodes(self):
+        """Optimized: Find tiles with fewer than MIN_NEIGHBORS and add nearest points."""
+        if not self.tiles:
             return
         
-        static_file = config["static_file"]
-        dynamic_file = config["dynamic_file"]
-        metadata_file = config["metadata_file"]
-        point_count = config["count"]
+        # Create position array and ID mapping for fast lookups
+        positions = []
+        tile_ids = []
+        tile_index_map = {}  # id -> index in positions array
+        tile_neighbors_map = {t.id: set(t.neighbors) for t in self.tiles}
         
-        print(f"\nExporting {tile_type.value} layer:")
-        print(f"  Static: {static_file}")
-        print(f"  Dynamic: {dynamic_file}")
-        print(f"  Metadata: {metadata_file}")
+        for idx, tile in enumerate(self.tiles):
+            positions.append([tile.x, tile.y, tile.z])
+            tile_ids.append(tile.id)
+            tile_index_map[tile.id] = idx
         
+        # Build KD-tree once
+        tree = cKDTree(positions)
+        
+        # Find tiles that need fixing
+        needs_fixing = [t for t in self.tiles if len(t.neighbors) < MIN_NEIGHBORS]
+        
+        if not needs_fixing:
+            print("  No low-degree nodes found!")
+            return
+        
+        print(f"  Fixing {len(needs_fixing):,} low-degree nodes...")
+        
+        bar = ProgressBar(len(needs_fixing), "  Fixing")
+        
+        for tile in needs_fixing:
+            current_neighbors = tile_neighbors_map[tile.id]
+            needed = MIN_NEIGHBORS - len(current_neighbors)
+            
+            if needed <= 0:
+                continue
+            
+            # Query more candidates than needed to have options
+            k = min(needed * 5 + 10, len(self.tiles))
+            distances, indices = tree.query((tile.x, tile.y, tile.z), k=k)
+            
+            added = 0
+            for neighbor_idx in indices:
+                if added >= needed:
+                    break
+                
+                neighbor_id = tile_ids[neighbor_idx]
+                
+                # Skip self and existing neighbors
+                if neighbor_id == tile.id or neighbor_id in current_neighbors:
+                    continue
+                
+                # Add neighbor relationship
+                current_neighbors.add(neighbor_id)
+                
+                # Add reverse relationship (using the map for O(1) access)
+                tile_neighbors_map[neighbor_id].add(tile.id)
+                
+                added += 1
+            
+            bar.update(1)
+        
+        bar.close()
+        
+        # Convert back to sorted lists
+        for tile in self.tiles:
+            tile.neighbors = sorted(tile_neighbors_map[tile.id])
+        
+        # Statistics after fixing
+        degrees = [len(t.neighbors) for t in self.tiles]
+        print(f"\n  After fixing low-degree nodes:")
+        print(f"    Average neighbors: {sum(degrees)/len(degrees):.2f}")
+        print(f"    Min neighbors: {min(degrees)}")
+        print(f"    Max neighbors: {max(degrees)}")
+        
+        still_low = sum(1 for d in degrees if d < MIN_NEIGHBORS)
+        if still_low > 0:
+            print(f"    WARNING: {still_low:,} tiles still have <{MIN_NEIGHBORS} neighbors")
+    
+    def export(self):
+        # Prepare static data
         static_data = []
         dynamic_data = []
         
-        bar = ProgressBar(len(tiles), "  Exporting tiles")
+        bar = ProgressBar(len(self.tiles), "  Exporting")
         
-        for tile in tiles:
-            static_tile = {
+        for tile in self.tiles:
+            static_data.append({
                 "id": tile.id,
-                "layer": tile.layer.value,
+                "type": tile.type,
                 "neighbors_b64": encode_neighbors(tile.neighbors),
                 "temperature": tile.temperature,
                 "precipitation": tile.precipitation,
                 "terrain": tile.terrain
-            }
-            static_data.append(static_tile)
+            })
             
-            dynamic_tile = {
+            dynamic_data.append({
                 "id": tile.id,
                 "vegetation": tile.vegetation,
                 "population": tile.population,
                 "buildings": tile.buildings
-            }
-            dynamic_data.append(dynamic_tile)
+            })
             
             bar.update(1)
         
         bar.close()
         
         # Save static data
-        with open(static_file, "w") as f:
+        with open(STATIC_FILE, "w") as f:
             json.dump(static_data, f, indent=2)
         
         # Save dynamic data
-        with open(dynamic_file, "w") as f:
+        with open(DYNAMIC_FILE, "w") as f:
             json.dump(dynamic_data, f, indent=2)
         
-        # Save metadata (critical for rendering!)
+        # Save metadata
         metadata = {
-            "layer": tile_type.value,
-            "point_count": point_count,
-            "tile_count": len(tiles),
+            "total_tiles": len(self.tiles),
+            "base_points": BASE_POINTS,
             "neighbor_count": NEIGHBOR_COUNT,
-            "id_range": {
-                "min": min(t.id for t in tiles),
-                "max": max(t.id for t in tiles)
+            "min_neighbors": MIN_NEIGHBORS,
+            "sampling_rates": SAMPLING_RATES,
+            "tiles_by_type": {
+                t_type: sum(1 for t in self.tiles if t.type == t_type)
+                for t_type in ["land", "coastal", "deep_sea"]
             },
-            "retention_rate": len(tiles) / point_count
+            "total_by_type": self.type_counts
         }
         
-        with open(metadata_file, "w") as f:
+        with open(METADATA_FILE, "w") as f:
             json.dump(metadata, f, indent=2)
         
-        print(f"  Exported {len(tiles):,} tiles")
-        print(f"  Metadata saved (point_count: {point_count:,})")
-    
-    def generate_all_layers(self):
-        print("\n" + "="*60)
-        print("HIERARCHICAL TILE GENERATION (3-COLOR MAP)")
-        print("="*60)
-        print("\nNOTE: Each layer has its own independent ID space starting from 0")
-        
-        for tile_type in [TileType.LAND, TileType.COASTAL, TileType.DEEP_SEA]:
-            config = LAYER_CONFIGS[tile_type.value]
-            num_points = int(config["count"])
-            tiles = self.generate_layer(tile_type, num_points)
-            self.build_neighbors_for_layer(tiles, NEIGHBOR_COUNT)
-            self.export_layer(tile_type, config)
-        
-        self.print_summary()
+        print(f"\n  Exported:")
+        print(f"    {STATIC_FILE}: {len(static_data):,} tiles")
+        print(f"    {DYNAMIC_FILE}: {len(dynamic_data):,} tiles")
+        print(f"    {METADATA_FILE}: metadata")
     
     def print_summary(self):
         print("\n" + "="*60)
-        print("GENERATION SUMMARY")
+        print("SUMMARY")
         print("="*60)
         
-        print(f"\nMAP COMPOSITION (based on {self.total_points_processed:,} samples):")
-        for tile_type in TileType:
-            count = self.type_counts[tile_type]
-            percentage = (count / self.total_points_processed) * 100 if self.total_points_processed > 0 else 0
-            bar_len = int(percentage / 2)
-            bar = "█" * bar_len + "░" * (50 - bar_len)
-            print(f"  {tile_type.value:10} {bar} {percentage:5.1f}% ({count:>8,})")
+        total_sampled = len(self.tiles)
+        total_possible = BASE_POINTS
         
-        print(f"\nLAYER STATISTICS:")
-        total_tiles = 0
+        print(f"\n  Base points:      {total_possible:>8,}")
+        print(f"  Sampled tiles:    {total_sampled:>8,}")
+        print(f"  Savings:          {total_possible - total_sampled:>8,} ({(1 - total_sampled/total_possible)*100:.1f}%)")
         
-        for tile_type in TileType:
-            tiles = self.tiles_by_layer[tile_type]
-            count = len(tiles)
-            total_tiles += count
-            config = LAYER_CONFIGS[tile_type.value]
-            target_points = config["count"]
-            
-            print(f"\n{tile_type.value.upper()}:")
-            print(f"  Points generated: {target_points:>8,}")
-            print(f"  Tiles saved:      {count:>8,}")
-            print(f"  Retention:        {(count/target_points*100) if target_points > 0 else 0:>7.1f}%")
-            
-            if count > 0:
-                print(f"  ID range:         0 to {count-1:,}")
-                sample = tiles[0]
-                lat, lon = xyz_to_latlon(sample.x, sample.y, sample.z)
-                print(f"  Sample location:  {lat:.1f}°, {lon:.1f}°")
+        print(f"\n  Tiles by type:")
+        for t_type in ["land", "coastal", "deep_sea"]:
+            total = self.type_counts[t_type]
+            sampled = sum(1 for t in self.tiles if t.type == t_type)
+            rate = SAMPLING_RATES[t_type]
+            print(f"    {t_type:10}: {sampled:>6,}/{total:>6,} (1/{rate})")
         
-        uniform_target = 2048 * 1024
-        savings = uniform_target - total_tiles
-        print(f"\n{'='*60}")
-        print(f"STORAGE COMPARISON:")
-        print(f"  Uniform (all tiles):   {uniform_target:>8,} tiles")
-        print(f"  Hierarchical (3 layers): {total_tiles:>8,} tiles")
-        print(f"  Savings:               {savings:>8,} tiles ({(1 - total_tiles/uniform_target)*100:.1f}% less)")
+        # Neighbor statistics
+        degrees = [len(t.neighbors) for t in self.tiles]
+        print(f"\n  Final neighbor statistics:")
+        print(f"    Average: {sum(degrees)/len(degrees):.2f}")
+        print(f"    Min: {min(degrees)}")
+        print(f"    Max: {max(degrees)}")
 
 
 # ============================================================
@@ -466,18 +540,13 @@ class HierarchicalTileGenerator:
 # ============================================================
 
 def main():
-    color_map = {
-        TileType.LAND: LAYER_CONFIGS["land"]["color"],
-        TileType.COASTAL: LAYER_CONFIGS["coastal"]["color"],
-        TileType.DEEP_SEA: LAYER_CONFIGS["deep_sea"]["color"]
-    }
+    classifier = MapClassifier(WORLD_MAP_IMAGE)
+    generator = TileGenerator(classifier)
+    generator.generate()
     
-    classifier = ThreeColorClassifier(WORLD_MAP_IMAGE, color_map)
-    generator = HierarchicalTileGenerator(classifier)
-    generator.generate_all_layers()
-    
-    print("\n✓ Hierarchical world generation complete!")
-    print("\nMetadata files created for each layer containing point_count.")
+    print("\n✓ Generation complete!")
+    print(f"  Neighbors were built on full point set first")
+    print(f"  Low-degree nodes (below {MIN_NEIGHBORS}) were fixed")
 
 
 if __name__ == "__main__":

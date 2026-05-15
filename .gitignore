@@ -11,8 +11,11 @@ deep_sea_static.json
 land_dynamic.json
 land_metadata.json
 land_static.json
-hierarchical_world_random.png
-hierarchical_world_type.png
+world_random.png
+world_type.png
 colors_precip.png
 colors_temp.png
 terrain_map.png
+tiles_dynamic.json
+tiles_metadata.json
+tiles_static.json
